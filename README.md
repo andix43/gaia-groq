@@ -1,16 +1,4 @@
 # gaia-groq
----
-title: GAIA Agent (Groq)
-emoji: 👽
-colorFrom: pink
-colorTo: indigo
-sdk: gradio
-sdk_version: 5.33.0
-app_file: app.py
-pinned: false
-hf_oauth: true
-hf_oauth_expiration_minutes: 480
----
 
 # GAIA Benchmark Agent — Groq edition
 
