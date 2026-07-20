@@ -46,10 +46,20 @@ def _truncate(text: str, limit: int = _MAX_CHARS) -> str:
 def read_file(file_path: str) -> str:
     """Read a local file and return its content as text.
 
-    Dispatches by extension: .txt/.md/.py/.json as text, .csv/.xlsx/.xls as a
-    tabular dump via pandas, .pdf via pdfplumber. Use this to inspect any file
-    that was attached to a question. For images use analyze_image; for audio use
-    transcribe_audio.
+    Dispatches by extension:
+      - .txt/.md/.py/.log/.xml/.html/.tsv : plain text
+      - .json                             : pretty-printed JSON
+      - .csv/.xlsx/.xls                   : tabular preview (shape + head)
+      - .pdf                              : extracted text (pdfplumber)
+      - .docx                             : paragraphs + tables (python-docx)
+      - .pptx                             : slide text (python-pptx)
+
+    Use this to inspect any attached file. For images use analyze_image; for
+    audio use transcribe_audio.
+
+    Note for computation on spreadsheets/CSVs: this returns only a preview. To
+    compute over the FULL data, load the file yourself in code, e.g.
+    `import pandas as pd; df = pd.read_excel(file_path)` and operate on `df`.
 
     Args:
         file_path: Absolute path to the local file to read.
@@ -70,20 +80,51 @@ def read_file(file_path: str) -> str:
         if ext == ".csv":
             import pandas as pd
             df = pd.read_csv(file_path)
-            return _truncate(f"CSV shape {df.shape}\n\n{df.to_string()}")
+            return _truncate(
+                f"CSV shape {df.shape}; columns={list(df.columns)}\n"
+                f"(load the full file with pd.read_csv('{file_path}') to compute)\n\n"
+                f"{df.head(30).to_string()}"
+            )
 
         if ext in {".xlsx", ".xls"}:
             import pandas as pd
             sheets = pd.read_excel(file_path, sheet_name=None)
-            out = [f"=== sheet: {name} (shape {df.shape}) ===\n{df.to_string()}"
-                   for name, df in sheets.items()]
-            return _truncate("\n\n".join(out))
+            out = []
+            for name, df in sheets.items():
+                out.append(
+                    f"=== sheet: {name} (shape {df.shape}); columns={list(df.columns)} ===\n"
+                    f"{df.head(30).to_string()}"
+                )
+            return _truncate(
+                f"(load the full workbook with pd.read_excel('{file_path}', "
+                f"sheet_name=None) to compute)\n\n" + "\n\n".join(out)
+            )
 
         if ext == ".pdf":
             import pdfplumber
             with pdfplumber.open(file_path) as pdf:
                 pages = [p.extract_text() or "" for p in pdf.pages]
             return _truncate("\n\n".join(pages))
+
+        if ext == ".docx":
+            import docx
+            d = docx.Document(file_path)
+            parts = [p.text for p in d.paragraphs if p.text.strip()]
+            for ti, tbl in enumerate(d.tables):
+                rows = [" | ".join(c.text for c in row.cells) for row in tbl.rows]
+                parts.append(f"[table {ti}]\n" + "\n".join(rows))
+            return _truncate("\n".join(parts))
+
+        if ext == ".pptx":
+            import pptx
+            prs = pptx.Presentation(file_path)
+            parts = []
+            for si, slide in enumerate(prs.slides, 1):
+                texts = [sh.text for sh in slide.shapes
+                         if getattr(sh, "has_text_frame", False) and sh.text.strip()]
+                if texts:
+                    parts.append(f"[slide {si}]\n" + "\n".join(texts))
+            return _truncate("\n\n".join(parts))
 
         # Unknown extension: best-effort text read.
         with open(file_path, "r", encoding="utf-8", errors="replace") as f:
