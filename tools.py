@@ -214,24 +214,13 @@ def get_youtube_transcript(url_or_id: str) -> str:
 # --------------------------------------------------------------------------- #
 # Web page reader                                                             #
 # --------------------------------------------------------------------------- #
-@tool
-def visit_webpage(url: str) -> str:
-    """Fetch a web page and return its MAIN text content, with navigation and
-    boilerplate stripped out, truncated to fit the token budget. Tables are
-    kept, so this works for pages like Wikipedia discographies. Use to read a
-    specific URL found via web_search.
-
-    Args:
-        url: The full URL to fetch.
-    """
+def _fetch_page_text(url: str) -> str:
+    """Fetch a URL and return cleaned main text (may be long)."""
     import re
     import requests
     headers = {"User-Agent": "Mozilla/5.0 (compatible; GaiaAgent/1.0)"}
-    try:
-        r = requests.get(url, headers=headers, timeout=30)
-        r.raise_for_status()
-    except Exception as e:
-        return f"ERROR fetching {url}: {type(e).__name__}: {e}"
+    r = requests.get(url, headers=headers, timeout=30)
+    r.raise_for_status()
 
     text = None
     try:
@@ -245,6 +234,56 @@ def visit_webpage(url: str) -> str:
             text = md(r.text)
         except Exception:
             text = r.text
+    return re.sub(r"\n{3,}", "\n\n", text or "").strip()
 
-    text = re.sub(r"\n{3,}", "\n\n", text).strip()
-    return _truncate(text)
+
+@tool
+def visit_webpage(url: str, search: str = "") -> str:
+    """Fetch a web page and return its MAIN text content (navigation/boilerplate
+    stripped, tables kept). Use to read a specific URL found via web_search.
+
+    IMPORTANT: the page is long and only a window of it is returned. If the part
+    you need (e.g. a "Discography" or "Studio albums" table) is not in the
+    default window, call this again with the `search` argument set to a keyword
+    that appears near it — the returned window will be centered on the first
+    match instead of the top of the page. This is how you reach content deep in
+    a long article. Do NOT re-fetch with the same arguments expecting a
+    different result.
+
+    Args:
+        url: The full URL to fetch.
+        search: Optional keyword. If given, return the window of text around the
+            first occurrence of this keyword (case-insensitive) instead of the
+            page top. Example: search="Discography".
+    """
+    try:
+        text = _fetch_page_text(url)
+    except Exception as e:
+        return f"ERROR fetching {url}: {type(e).__name__}: {e}"
+
+    if not text:
+        return f"ERROR: no readable text extracted from {url}"
+
+    if search:
+        idx = text.lower().find(search.lower())
+        if idx == -1:
+            # Report what headings DO exist so the agent can pick a real one.
+            import re
+            heads = re.findall(r"^#{1,6}\s*(.+)$|^\s*(.+)\n[=-]{3,}\s*$",
+                               text, flags=re.MULTILINE)
+            flat = [h[0] or h[1] for h in heads][:30]
+            hint = ("; ".join(flat) if flat
+                    else "no clear headings found")
+            return (f"'{search}' not found on page. Sections/headings present: "
+                    f"{hint}. Total page length {len(text)} chars.")
+        start = max(0, idx - 200)
+        window = text[start:start + _MAX_CHARS]
+        return (f"[window around '{search}', page is {len(text)} chars total]\n"
+                + window)
+
+    # No search term: return the top window, but say how much more there is.
+    if len(text) > _MAX_CHARS:
+        return (f"[showing first {_MAX_CHARS} of {len(text)} chars; call again "
+                f"with search='<keyword>' to jump to a later section]\n"
+                + text[:_MAX_CHARS])
+    return text
