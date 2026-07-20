@@ -31,6 +31,7 @@ All three read the same GROQ_API_KEY.
 
 import os
 import re
+import json
 import time
 import random
 
@@ -40,6 +41,7 @@ from smolagents import (
     DuckDuckGoSearchTool,
     WikipediaSearchTool,
 )
+from smolagents.models import ChatMessage
 from smolagents.monitoring import LogLevel
 
 from tools import (
@@ -54,10 +56,32 @@ from tools import (
 # CONFIG — everything provider-specific lives here                            #
 # --------------------------------------------------------------------------- #
 # LiteLLM routes any "groq/..." model id to Groq using GROQ_API_KEY.
-REASONING_MODEL_ID = os.getenv("GROQ_MODEL_ID", "groq/openai/gpt-oss-120b")
+# Qwen (qwen3.6-27b) is used for reasoning: it emits smolagents-style code blocks
+# reliably, unlike Groq's gpt-oss models, which try to emit native tool calls and
+# trip Groq's "Tool choice is none, but model called a tool" error under CodeAgent.
+# It is also multimodal, so the same model powers analyze_image.
+REASONING_MODEL_ID = os.getenv("GROQ_MODEL_ID", "groq/qwen/qwen3.6-27b")
 
 # GAIA answer-format rules, appended to every task. The course grader does exact
 # string matching, so format discipline is worth as much as being right.
+GAIA_STRATEGY = """
+Pick the approach that fits the question:
+- Pure reasoning / math / logic / puzzles (e.g. a table to analyze, a sequence,
+  unit conversions): DO NOT search the web. Write Python and compute the answer
+  directly. You have pandas, numpy, math, statistics, itertools, collections.
+- Facts about the world (people, dates, records, "how many X"): use web_search
+  then visit_webpage to read the best source. For long pages (Wikipedia), if the
+  section you need isn't in the first window, call visit_webpage(url,
+  search="<keyword>") to jump to it.
+- An attached file: use read_file for text/pdf/docx/pptx/csv; for spreadsheets
+  you may also load it yourself, e.g. `import pandas as pd; df =
+  pd.read_excel(path)`, then compute. Use analyze_image for images and
+  transcribe_audio for audio.
+- A YouTube link: use get_youtube_transcript.
+Be efficient: most questions need 1–3 steps. Verify before answering.
+""".strip()
+
+
 GAIA_FORMATTING = """
 When you have the answer, call final_answer with ONLY the answer itself — no
 explanation, no "FINAL ANSWER" label, no surrounding sentence.
@@ -76,14 +100,72 @@ Format rules for the final answer:
 # --------------------------------------------------------------------------- #
 # Rate-limit resilient model                                                  #
 # --------------------------------------------------------------------------- #
-class GroqLiteLLMModel(LiteLLMModel):
-    """LiteLLMModel that retries on Groq's per-minute rate limits.
+# --------------------------------------------------------------------------- #
+# tool_use_failed recovery                                                    #
+# --------------------------------------------------------------------------- #
+# Some Groq models (notably the gpt-oss family) emit a NATIVE tool call even
+# though CodeAgent runs with tool_choice=none, so Groq returns
+#   400 tool_use_failed: "Tool choice is none, but model called a tool"
+# The good news: the rejected payload is echoed back in a `failed_generation`
+# field. We extract the code/tool-call the model wanted and re-present it as a
+# normal CodeAgent code blob, so the step succeeds instead of dying.
+def _extract_failed_generation(err_str: str) -> str | None:
+    m = re.search(r'"failed_generation"\s*:\s*"(.*)"\s*\}\s*\}', err_str, re.DOTALL)
+    if not m:
+        return None
+    raw = m.group(1)
+    try:
+        raw = raw.encode("utf-8").decode("unicode_escape")
+    except Exception:
+        pass
+    return raw
 
-    Groq's free/dev tiers cap tokens-per-minute (as low as ~6k TPM), and a
-    CodeAgent keeps the whole trajectory in context, so a multi-step question
-    can trip the limit mid-run. On a RateLimitError we parse Groq's suggested
-    wait ("Please try again in 4.2s" / a ``retry-after`` header) and sleep that
-    long, with exponential backoff + jitter as a fallback.
+
+def _code_from_payload(payload: str) -> str:
+    """payload ~ {"name": "<tool>", "arguments": <code-or-json>}."""
+    payload = payload.strip()
+    try:
+        obj = json.loads(payload)
+        name = obj.get("name", "")
+        args = obj.get("arguments", {})
+        if name in ("python", "code", "code_interpreter", "python_interpreter"):
+            if isinstance(args, dict):
+                return args.get("code") or args.get("arguments") or ""
+            return str(args)
+        # A real tool -> synthesize a python call to it (tools are py functions).
+        if isinstance(args, dict):
+            kw = ", ".join(f"{k}={v!r}" for k, v in args.items())
+            return f"result = {name}({kw})\nprint(result)"
+        return f"result = {name}({args!r})\nprint(result)"
+    except Exception:
+        pass
+    # Malformed JSON: take the raw code after "arguments":, drop the envelope brace.
+    m = re.search(r'"arguments"\s*:\s*', payload)
+    code = payload[m.end():] if m else payload
+    return re.sub(r'\s*\}\s*$', '', code.strip()).strip()
+
+
+def _recover_code_blob(err_str: str) -> str | None:
+    payload = _extract_failed_generation(err_str)
+    if not payload:
+        return None
+    code = _code_from_payload(payload)
+    if not code.strip():
+        return None
+    # CodeAgent's parser looks for a ```py fenced block.
+    return f"Thought: (recovered from a rejected tool call)\nCode:\n```py\n{code}\n```<end_code>"
+
+
+class GroqLiteLLMModel(LiteLLMModel):
+    """LiteLLMModel hardened for Groq under smolagents CodeAgent.
+
+    Handles two Groq-specific failure modes:
+    * Rate limits — the free/dev tiers cap tokens-per-minute (as low as ~6k),
+      and a CodeAgent keeps the whole trajectory in context, so a multi-step
+      question can trip the limit mid-run. We parse Groq's suggested wait
+      ("try again in 4.2s") and sleep, with exponential backoff as a fallback.
+    * tool_use_failed — a model tried to emit a native tool call; we recover the
+      code from the error and return it as a valid code blob (see above).
     """
 
     def __init__(self, *args, max_retries: int = 3, **kwargs):
@@ -93,16 +175,13 @@ class GroqLiteLLMModel(LiteLLMModel):
     @staticmethod
     def _parse_wait_seconds(err: Exception, attempt: int) -> float:
         msg = str(err)
-        # Groq phrasings: "try again in 4.2s" / "in 1m2.3s"
         m = re.search(r"try again in ((\d+)m)?([\d.]+)s", msg, flags=re.IGNORECASE)
         if m:
             minutes = int(m.group(2)) if m.group(2) else 0
             return minutes * 60 + float(m.group(3))
-        # retryDelay JSON (some gateways) or Retry-After header echoed in text
         m = re.search(r'retry[-_ ]?(?:after|delay)"?[:=]\s*"?(\d+)', msg, flags=re.IGNORECASE)
         if m:
             return float(m.group(1))
-        # Fallback: exponential backoff with jitter, capped at 60s.
         return min(60.0, (2 ** attempt) + random.uniform(0, 1))
 
     def generate(self, messages, **kwargs):  # type: ignore[override]
@@ -110,14 +189,24 @@ class GroqLiteLLMModel(LiteLLMModel):
         for attempt in range(self._max_retries):
             try:
                 return super().generate(messages, **kwargs)
-            except Exception as e:  # litellm.RateLimitError and friends
-                if "rate" not in str(e).lower() and "429" not in str(e):
-                    raise  # not a rate-limit problem — surface immediately
-                last_err = e
-                wait = self._parse_wait_seconds(e, attempt)
-                print(f"[groq] rate limited (attempt {attempt + 1}/"
-                      f"{self._max_retries}); sleeping {wait:.1f}s")
-                time.sleep(wait)
+            except Exception as e:
+                s = str(e)
+                # 1) Recover a rejected native tool call into a code blob.
+                if "tool_use_failed" in s or "model called a tool" in s:
+                    blob = _recover_code_blob(s)
+                    if blob:
+                        print("[groq] recovered code from a rejected tool call")
+                        return ChatMessage(role="assistant", content=blob)
+                    raise
+                # 2) Back off on rate limits.
+                if "rate" in s.lower() or "429" in s:
+                    last_err = e
+                    wait = self._parse_wait_seconds(e, attempt)
+                    print(f"[groq] rate limited (attempt {attempt + 1}/"
+                          f"{self._max_retries}); sleeping {wait:.1f}s")
+                    time.sleep(wait)
+                    continue
+                raise  # anything else: surface immediately
         raise RuntimeError(f"Groq rate limit not cleared after "
                            f"{self._max_retries} retries: {last_err}")
 
@@ -148,11 +237,12 @@ def build_agent(verbose: bool = False) -> CodeAgent:
     return CodeAgent(
         tools=tools,
         model=model,
-        max_steps=8,
+        max_steps=6,
         verbosity_level=LogLevel.DEBUG if verbose else LogLevel.INFO,
         additional_authorized_imports=[
             "pandas", "numpy", "math", "statistics", "datetime",
             "json", "re", "itertools", "collections",
+            "openpyxl", "csv", "docx", "pptx", "bs4",
         ],
     )
 
@@ -244,7 +334,7 @@ class GaiaAgent:
                 "Use read_file / analyze_image / transcribe_audio on that path "
                 "as appropriate."
             )
-        task += "\n\n" + GAIA_FORMATTING
+        task += "\n\n" + GAIA_STRATEGY + "\n\n" + GAIA_FORMATTING
 
         try:
             raw = self.agent.run(task)
