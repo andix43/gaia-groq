@@ -1,0 +1,18 @@
+gradio
+gradio[oauth]
+requests
+pandas
+openpyxl
+pdfplumber
+# agent framework + Groq access (LiteLLM routes groq/* ids via GROQ_API_KEY)
+smolagents[litellm]>=1.26.0
+litellm>=1.40.0
+# search / web tools
+ddgs
+wikipedia-api
+markdownify
+trafilatura
+youtube-transcript-api
+# image fallback OCR (used only if the Groq vision model is unavailable)
+pillow
+pytesseract
