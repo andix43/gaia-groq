@@ -86,7 +86,7 @@ class GroqLiteLLMModel(LiteLLMModel):
     long, with exponential backoff + jitter as a fallback.
     """
 
-    def __init__(self, *args, max_retries: int = 5, **kwargs):
+    def __init__(self, *args, max_retries: int = 3, **kwargs):
         super().__init__(*args, **kwargs)
         self._max_retries = max_retries
 
@@ -148,7 +148,7 @@ def build_agent(verbose: bool = False) -> CodeAgent:
     return CodeAgent(
         tools=tools,
         model=model,
-        max_steps=6,
+        max_steps=8,
         verbosity_level=LogLevel.DEBUG if verbose else LogLevel.INFO,
         additional_authorized_imports=[
             "pandas", "numpy", "math", "statistics", "datetime",
