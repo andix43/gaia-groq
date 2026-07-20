@@ -4,6 +4,8 @@ requests
 pandas
 openpyxl
 pdfplumber
+python-docx
+python-pptx
 # agent framework + Groq access (LiteLLM routes groq/* ids via GROQ_API_KEY)
 smolagents[litellm]>=1.26.0
 litellm>=1.40.0
