@@ -1,5 +1,3 @@
-# gaia-groq
-
 # GAIA Benchmark Agent — Groq edition
 
 A [smolagents](https://github.com/huggingface/smolagents) `CodeAgent` for the
