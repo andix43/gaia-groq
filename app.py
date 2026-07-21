@@ -1,14 +1,12 @@
 """
-Gradio front-end for the HF Agents Course final assignment.
+Gradio app for the GAIA Agents Course final assignment (Groq edition).
 
-Flow (run_and_submit_all):
-  1. Read HF username + agent_code from the logged-in profile / SPACE_ID.
-  2. GET /questions.
-  3. For each question: if it has an attached file, download it via
-     /files/{task_id}; run GaiaAgent; collect {task_id, submitted_answer}.
-  4. POST /submit and show the returned score.
+Duplicate the course template Space, drop in this file plus agent.py, tools.py,
+requirements.txt, add GROQ_API_KEY as a Space secret, and keep the Space PUBLIC.
+Log in with Hugging Face, then click "Run & Submit All".
 
-Keep the Space PUBLIC or agent_code verification fails.
+You can also skip this UI entirely and submit from Colab with run_local.py; the
+scoring API only records the agent_code URL, it does not run your Space.
 """
 
 import os
@@ -16,22 +14,18 @@ import tempfile
 
 import gradio as gr
 import requests
-import pandas as pd
 
 from agent import GaiaAgent
 
-DEFAULT_API_URL = "https://agents-course-unit4-scoring.hf.space"
+API_URL = "https://agents-course-unit4-scoring.hf.space"
 
 
-def _download_file(task_id: str, file_name: str, api_url: str) -> str | None:
-    """Download the attachment for a task to a temp path. Returns the path or None."""
+def _download(task_id, file_name):
     try:
-        r = requests.get(f"{api_url}/files/{task_id}", timeout=60)
+        r = requests.get(f"{API_URL}/files/{task_id}", timeout=60)
         r.raise_for_status()
-    except Exception as e:
-        print(f"[file] could not download for {task_id}: {e}")
+    except Exception:
         return None
-    # Preserve the extension so read_file/analyze_image can dispatch correctly.
     suffix = os.path.splitext(file_name)[1] if file_name else ""
     path = os.path.join(tempfile.gettempdir(), f"{task_id}{suffix}")
     with open(path, "wb") as f:
@@ -40,98 +34,79 @@ def _download_file(task_id: str, file_name: str, api_url: str) -> str | None:
 
 
 def run_and_submit_all(profile: gr.OAuthProfile | None):
-    space_id = os.getenv("SPACE_ID")
-
     if profile is None:
-        return "Please log in to Hugging Face with the button above.", None
+        return "Please log in with Hugging Face first (button above).", None
     username = profile.username
-    print(f"User: {username}")
 
-    api_url = DEFAULT_API_URL
-    questions_url = f"{api_url}/questions"
-    submit_url = f"{api_url}/submit"
-    agent_code = f"https://huggingface.co/spaces/{space_id}/tree/main"
+    space_id = os.getenv("SPACE_ID")
+    agent_code = (f"https://huggingface.co/spaces/{space_id}/tree/main"
+                  if space_id else "https://huggingface.co/")
 
-    # 1. Instantiate agent
     try:
         agent = GaiaAgent()
     except Exception as e:
         return f"Error initializing agent: {e}", None
 
-    # 2. Fetch questions
     try:
-        resp = requests.get(questions_url, timeout=30)
-        resp.raise_for_status()
-        questions = resp.json()
+        r = requests.get(f"{API_URL}/questions", timeout=30)
+        r.raise_for_status()
+        questions = r.json()
     except Exception as e:
         return f"Error fetching questions: {e}", None
-    print(f"Fetched {len(questions)} questions.")
 
-    # 3. Run agent
-    results_log = []
-    answers_payload = []
+    rows, payload = [], []
     for item in questions:
         task_id = item.get("task_id")
-        question = item.get("question")
-        file_name = item.get("file_name")  # empty string when no attachment
-        if not task_id or question is None:
+        question = item.get("question", "")
+        file_name = item.get("file_name") or ""
+        if not task_id:
             continue
-
-        file_path = None
-        if file_name:
-            file_path = _download_file(task_id, file_name, api_url)
-
         try:
-            answer = agent(question, file_path)
+            fp = _download(task_id, file_name) if file_name else None
+            ans = agent(question, fp)
         except Exception as e:
-            answer = "ERROR"
-            print(f"[task {task_id}] {type(e).__name__}: {e}")
+            ans = "ERROR"
+            print(f"[{task_id}] failed: {e}")
+        payload.append({"task_id": task_id, "submitted_answer": ans})
+        rows.append({"Task ID": task_id, "Question": question[:80], "Answer": ans})
 
-        answers_payload.append({"task_id": task_id, "submitted_answer": answer})
-        results_log.append(
-            {"Task ID": task_id, "Question": question[:80], "Answer": answer}
-        )
-        print(f"[{task_id}] -> {answer!r}")
+    if not payload:
+        return "Agent produced no answers.", None
 
-    if not answers_payload:
-        return "Agent produced no answers.", pd.DataFrame(results_log)
-
-    # 4. Submit
-    submission = {
-        "username": username.strip(),
-        "agent_code": agent_code,
-        "answers": answers_payload,
-    }
     try:
-        resp = requests.post(submit_url, json=submission, timeout=120)
+        resp = requests.post(
+            f"{API_URL}/submit",
+            json={"username": username.strip(), "agent_code": agent_code,
+                  "answers": payload},
+            timeout=120,
+        )
         resp.raise_for_status()
         data = resp.json()
     except Exception as e:
-        return f"Submission failed: {e}", pd.DataFrame(results_log)
+        return f"Submission failed: {e}", rows
 
     status = (
         f"Submission successful.\n"
         f"User: {data.get('username')}\n"
-        f"Score: {data.get('score')}% "
-        f"({data.get('correct_count')}/{data.get('total_attempted')} correct)\n"
-        f"Message: {data.get('message')}"
+        f"Score: {data.get('score', 'N/A')}% "
+        f"({data.get('correct_count', '?')}/{data.get('total_attempted', '?')} correct)\n"
+        f"Message: {data.get('message', '')}"
     )
-    return status, pd.DataFrame(results_log)
+    return status, rows
 
 
 with gr.Blocks() as demo:
-    gr.Markdown("# GAIA Agent — Final Assignment")
+    gr.Markdown("# GAIA Agent (Groq) — Final Assignment")
     gr.Markdown(
-        "1. Log in to Hugging Face.  2. Click **Run Evaluation & Submit All Answers**.\n\n"
-        "The run may take several minutes — it calls the model once per question."
+        "1. Log in with Hugging Face. 2. Click **Run & Submit All**. "
+        "The agent answers all 20 questions and submits for scoring. "
+        "(A full run can take a while on Groq's free tier.)"
     )
     gr.LoginButton()
-    run_button = gr.Button("Run Evaluation & Submit All Answers", variant="primary")
+    run_button = gr.Button("Run & Submit All", variant="primary")
     status_box = gr.Textbox(label="Result", lines=6, interactive=False)
-    results_table = gr.DataFrame(label="Per-question answers", wrap=True)
-
-    run_button.click(fn=run_and_submit_all, outputs=[status_box, results_table])
-
+    table = gr.DataFrame(label="Answers", wrap=True)
+    run_button.click(fn=run_and_submit_all, outputs=[status_box, table])
 
 if __name__ == "__main__":
-    demo.launch(debug=True)
+    demo.launch(debug=False, share=False)
