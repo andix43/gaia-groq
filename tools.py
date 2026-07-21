@@ -25,7 +25,11 @@ VISION_MODEL = os.getenv("GROQ_VISION_MODEL", os.getenv("GROQ_MODEL_ID", "groq/q
 WHISPER_MODEL = os.getenv("GROQ_WHISPER_MODEL", "whisper-large-v3-turbo")
 
 # Tight budget: smaller outputs mean fewer rate-limit stalls on the free tier.
-_MAX_CHARS = 1800
+_MAX_CHARS = 1200
+
+# Optional proxy for YouTube (Colab/cloud IPs are usually blocked). Set e.g.
+#   export YOUTUBE_PROXY="http://user:pass@host:port"
+_YT_PROXY = os.getenv("YOUTUBE_PROXY", "").strip()
 
 
 def _truncate(text: str, limit: int = _MAX_CHARS) -> str:
@@ -240,7 +244,9 @@ def _yt_id(url_or_id: str) -> str:
 @tool
 def get_youtube_transcript(url_or_id: str) -> str:
     """Fetch the transcript (spoken words) of a YouTube video. Use when the
-    answer is in what is SAID. Accepts a URL or a bare video id.
+    answer is in what is SAID. Accepts a URL or a bare video id. Note: YouTube
+    blocks cloud/Colab IPs; set YOUTUBE_PROXY (a residential proxy) if this
+    returns RequestBlocked.
 
     Args:
         url_or_id: A YouTube URL or the raw video id.
@@ -251,7 +257,18 @@ def get_youtube_transcript(url_or_id: str) -> str:
         return f"ERROR: youtube-transcript-api not installed: {e}"
     vid = _yt_id(url_or_id)
     try:
-        fetched = YouTubeTranscriptApi().fetch(vid)
+        # Configure a proxy if provided (helps get around cloud-IP blocks).
+        api = None
+        if _YT_PROXY:
+            try:
+                from youtube_transcript_api.proxies import GenericProxyConfig
+                api = YouTubeTranscriptApi(
+                    proxy_config=GenericProxyConfig(http_url=_YT_PROXY, https_url=_YT_PROXY)
+                )
+            except Exception:
+                api = None
+        api = api or YouTubeTranscriptApi()
+        fetched = api.fetch(vid)
         try:
             text = " ".join(s["text"] for s in fetched.to_raw_data())
         except AttributeError:
@@ -283,7 +300,10 @@ def analyze_youtube_video(url: str, question: str, every_n_seconds: int = 15) ->
     try:
         with tempfile.TemporaryDirectory() as td:
             opts = {"format": "worstvideo[ext=mp4]/mp4", "quiet": True,
-                    "outtmpl": os.path.join(td, "v.%(ext)s"), "force_ipv4": True}
+                    "outtmpl": os.path.join(td, "v.%(ext)s"), "force_ipv4": True,
+                    "socket_timeout": 20, "retries": 1}
+            if _YT_PROXY:
+                opts["proxy"] = _YT_PROXY
             with yt_dlp.YoutubeDL(opts) as ydl:
                 ydl.extract_info(url, download=True)
             vf = next((os.path.join(td, f) for f in os.listdir(td)
