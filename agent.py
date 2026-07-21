@@ -1,20 +1,20 @@
 """
-GaiaAgent — a smolagents CodeAgent tuned for the HF Agents Course GAIA subset,
-running entirely on Groq.
+GaiaAgent — a smolagents CodeAgent for the HF Agents Course GAIA subset, running
+entirely on Groq. Final build: tuned to run through all 20 questions smoothly
+(bounded time + steps per question) rather than to maximize accuracy.
 
-Design summary
---------------
-* Reasoning + vision: Qwen (groq/qwen/qwen3.6-27b). Qwen writes smolagents code
-  blocks reliably. The gpt-oss models do NOT — under CodeAgent they emit native
-  tool calls that Groq rejects ("tool_use_failed"), and they mangle code blobs.
-  A gpt-oss id is therefore actively warned against below.
-* Audio: Groq Whisper (whisper-large-v3-turbo).
-* One GROQ_API_KEY covers text, image, and audio.
+Models (all via GROQ_API_KEY, overridable by env):
+    GROQ_MODEL_ID      reasoning + vision   default groq/qwen/qwen3.6-27b
+    GROQ_VISION_MODEL  images               default = GROQ_MODEL_ID
+    GROQ_WHISPER_MODEL audio                default whisper-large-v3-turbo
 
-Everything is overridable by env var:
-    GROQ_MODEL_ID      reasoning+vision model  (default groq/qwen/qwen3.6-27b)
-    GROQ_VISION_MODEL  image model             (default = GROQ_MODEL_ID)
-    GROQ_WHISPER_MODEL audio model             (default whisper-large-v3-turbo)
+Robustness features:
+  * Rate-limit backoff with a PER-QUESTION sleep budget (bails a question
+    gracefully instead of blocking the whole run).
+  * tool_use_failed recovery (recovers code from a rejected native tool call).
+  * <think>-block stripping (keeps context small; stops reasoning leaking into
+    answers).
+  * Answer normalization toward GAIA exact-match format.
 """
 
 import os
@@ -46,34 +46,44 @@ from tools import (
 # --------------------------------------------------------------------------- #
 REASONING_MODEL_ID = os.getenv("GROQ_MODEL_ID", "groq/qwen/qwen3.6-27b")
 
-# Short prompts = fewer tokens per step = fewer rate-limit stalls on the free
-# tier. Keep these tight.
+# Max seconds a single question may spend sleeping on rate limits before we give
+# up on it and move on. Keeps the whole 20-question run bounded.
+MAX_QUESTION_SLEEP = float(os.getenv("GAIA_MAX_QUESTION_SLEEP", "150"))
+MAX_STEPS = int(os.getenv("GAIA_MAX_STEPS", "4"))
+
 GAIA_STRATEGY = (
-    "Choose the fewest steps. Pure math/logic/table/puzzle questions: write "
-    "Python and compute (pandas, numpy, math, itertools available) — do NOT "
-    "search. World facts ('how many', dates, records): web_search then "
-    "visit_webpage; for a long page, visit_webpage(url, search='<keyword>') "
-    "jumps to a section. Attached file: read_file (text/pdf/docx/pptx/csv/xlsx) "
-    "or load it with pandas; analyze_image for images; transcribe_audio for "
-    "audio. YouTube: get_youtube_transcript (spoken) or analyze_youtube_video "
-    "(visual). Encoded/reversed text: decode in Python. Verify, then answer."
+    "Choose the fewest steps. Pure math/logic/table/puzzle: write Python and "
+    "compute (pandas, numpy, math, itertools) — do NOT search. World facts: "
+    "web_search then visit_webpage; for a long page, visit_webpage(url, "
+    "search='<keyword>') jumps to a section. Attached file: read_file "
+    "(text/pdf/docx/pptx/csv/xlsx) or load with pandas; analyze_image for "
+    "images; transcribe_audio for audio. YouTube: get_youtube_transcript "
+    "(spoken) or analyze_youtube_video (visual). Encoded/reversed text: decode "
+    "in Python. If a tool fails twice, give your best answer instead of "
+    "retrying. Verify, then answer."
 )
 
 GAIA_FORMATTING = (
-    "Call final_answer with ONLY the answer — no label, no sentence. "
-    "Number: plain digits, no separators/units unless asked. "
-    "String: no articles, no abbreviations, match the source's spelling. "
-    "List: comma+space separated, no brackets."
+    "Call final_answer with ONLY the answer — no label, no sentence. Number: "
+    "plain digits, no separators/units unless asked. String: no articles, no "
+    "abbreviations, match the source's spelling. List: comma+space separated, "
+    "no brackets."
 )
 
 
 # --------------------------------------------------------------------------- #
-# tool_use_failed recovery                                                    #
+# helpers: think-stripping + tool_use_failed recovery                         #
 # --------------------------------------------------------------------------- #
-# Some Groq models emit a NATIVE tool call under CodeAgent (tool_choice=none),
-# so Groq returns 400 tool_use_failed and echoes the payload in
-# `failed_generation`. We recover the intended code and return it as a code
-# blob so the step still runs.
+def _strip_think(text):
+    if not isinstance(text, str):
+        return text
+    out = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+    if "<think>" in out and "</think>" not in out:
+        head = out.split("<think>", 1)[0]
+        out = head if head.strip() else out.replace("<think>", "")
+    return out.strip()
+
+
 def _extract_failed_generation(err_str: str) -> str | None:
     m = re.search(r'"failed_generation"\s*:\s*"(.*)"\s*\}\s*\}', err_str, re.DOTALL)
     if not m:
@@ -114,17 +124,24 @@ def _recover_code_blob(err_str: str) -> str | None:
     code = _code_from_payload(payload)
     if not code.strip():
         return None
-    # ```py fence is accepted by smolagents' markdown fallback across versions.
     return f"Thought: (recovered from a rejected tool call)\nCode:\n```py\n{code}\n```<end_code>"
 
 
+# --------------------------------------------------------------------------- #
+# Model                                                                       #
+# --------------------------------------------------------------------------- #
 class GroqLiteLLMModel(LiteLLMModel):
-    """LiteLLMModel hardened for Groq under CodeAgent: rate-limit backoff +
-    tool_use_failed recovery."""
+    """Groq-hardened model: rate-limit backoff (with per-question sleep budget),
+    tool_use_failed recovery, and <think> stripping."""
 
-    def __init__(self, *args, max_retries: int = 2, **kwargs):
+    def __init__(self, *args, max_retries: int = 3, **kwargs):
         super().__init__(*args, **kwargs)
         self._max_retries = max_retries
+        self._question_sleep = 0.0
+
+    def new_question(self):
+        """Reset the per-question sleep budget. Call at the start of each Q."""
+        self._question_sleep = 0.0
 
     @staticmethod
     def _parse_wait_seconds(err: Exception, attempt: int) -> float:
@@ -142,7 +159,10 @@ class GroqLiteLLMModel(LiteLLMModel):
         last_err = None
         for attempt in range(self._max_retries):
             try:
-                return super().generate(messages, **kwargs)
+                msg = super().generate(messages, **kwargs)
+                if getattr(msg, "content", None):
+                    msg.content = _strip_think(msg.content)
+                return msg
             except Exception as e:
                 s = str(e)
                 if "tool_use_failed" in s or "model called a tool" in s:
@@ -154,22 +174,29 @@ class GroqLiteLLMModel(LiteLLMModel):
                 if "rate" in s.lower() or "429" in s:
                     last_err = e
                     wait = self._parse_wait_seconds(e, attempt)
+                    if self._question_sleep + wait > MAX_QUESTION_SLEEP:
+                        raise RuntimeError(
+                            f"per-question sleep budget "
+                            f"({MAX_QUESTION_SLEEP:.0f}s) exhausted; skipping"
+                        )
+                    self._question_sleep += wait
                     print(f"[groq] rate limited (attempt {attempt + 1}/"
-                          f"{self._max_retries}); sleeping {wait:.1f}s")
+                          f"{self._max_retries}); sleeping {wait:.1f}s "
+                          f"(budget {self._question_sleep:.0f}/"
+                          f"{MAX_QUESTION_SLEEP:.0f}s)")
                     time.sleep(wait)
                     continue
                 raise
-        raise RuntimeError(f"Groq rate limit not cleared after "
-                           f"{self._max_retries} retries: {last_err}")
+        raise RuntimeError(f"rate limit not cleared after {self._max_retries} "
+                           f"retries: {last_err}")
 
 
 def build_model() -> GroqLiteLLMModel:
     if not os.getenv("GROQ_API_KEY"):
         print("[warn] GROQ_API_KEY is not set — Groq calls will fail.")
     if "gpt-oss" in REASONING_MODEL_ID:
-        print("[warn] gpt-oss models emit native tool calls that break "
-              "CodeAgent (tool_use_failed) and mangle code blobs. Strongly "
-              "prefer groq/qwen/qwen3.6-27b. Unset GROQ_MODEL_ID to use it.")
+        print("[warn] gpt-oss breaks CodeAgent (tool_use_failed / bad code "
+              "blobs). Prefer groq/qwen/qwen3.6-27b; unset GROQ_MODEL_ID.")
     return GroqLiteLLMModel(model_id=REASONING_MODEL_ID, temperature=0.0)
 
 
@@ -191,7 +218,7 @@ def build_agent(verbose: bool = False) -> CodeAgent:
     return CodeAgent(
         tools=tools,
         model=model,
-        max_steps=5,
+        max_steps=MAX_STEPS,
         verbosity_level=LogLevel.DEBUG if verbose else LogLevel.INFO,
         additional_authorized_imports=[
             "pandas", "numpy", "math", "statistics", "datetime",
@@ -243,9 +270,8 @@ def looks_reversed(text: str) -> bool:
 def normalize_answer(ans: str) -> str:
     if ans is None:
         return ""
-    s = str(ans).strip()
+    s = _strip_think(str(ans)).strip()
     s = re.sub(r"^\s*(final answer|answer)\s*:?\s*", "", s, flags=re.IGNORECASE)
-    # Drop any stray code-blob tags a model may have leaked into the answer.
     s = s.replace("```py", "").replace("```python", "").replace("```", "")
     s = s.replace("<code>", "").replace("</code>", "").replace("<end_code>", "")
     s = s.strip().strip('"').strip("'").strip()
@@ -267,6 +293,12 @@ class GaiaAgent:
         print(f"GaiaAgent ready on Groq ({REASONING_MODEL_ID}).")
 
     def __call__(self, question: str, file_path: str | None = None) -> str:
+        # Reset the per-question rate-limit sleep budget.
+        try:
+            self.agent.model.new_question()
+        except Exception:
+            pass
+
         task = question
         if looks_reversed(question):
             task += ("\n\nNOTE: the question text may be reversed. Reversed "
@@ -274,7 +306,7 @@ class GaiaAgent:
         if file_path:
             task += (f"\n\nA file is attached at:\n{file_path}\nUse read_file / "
                      "analyze_image / transcribe_audio on it as appropriate.")
-        task += "\n\n" + GAIA_STRATEGY + "\n\n" + GAIA_FORMATTING
+        task += "\n\n" + GAIA_STRATEGY + "\n\n" + GAIA_FORMATTING + "\n/no_think"
 
         try:
             raw = self.agent.run(task)
