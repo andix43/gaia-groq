@@ -6,15 +6,19 @@ openpyxl
 pdfplumber
 python-docx
 python-pptx
-# agent framework + Groq access (LiteLLM routes groq/* ids via GROQ_API_KEY)
+# agent framework + Groq (LiteLLM routes groq/* ids via GROQ_API_KEY)
 smolagents[litellm]>=1.26.0
 litellm>=1.40.0
-# search / web tools
+# search / web
 ddgs
 wikipedia-api
 markdownify
 trafilatura
 youtube-transcript-api
-# image fallback OCR (used only if the Groq vision model is unavailable)
+# image OCR fallback
 pillow
 pytesseract
+# youtube visual analysis (analyze_youtube_video)
+yt-dlp
+imageio
+imageio-ffmpeg
