@@ -2,31 +2,19 @@
 GaiaAgent — a smolagents CodeAgent tuned for the HF Agents Course GAIA subset,
 running entirely on Groq.
 
-Why Groq
---------
-Groq serves open models on LPU hardware at very high throughput, and — crucially
-for GAIA — it hosts BOTH a vision model and Whisper speech-to-text, so text,
-image, and audio questions can all be answered on a single provider with one API
-key. The reasoning LLM, the vision model, and the audio model are each swappable
-via environment variables (see the CONFIG block below).
+Design summary
+--------------
+* Reasoning + vision: Qwen (groq/qwen/qwen3.6-27b). Qwen writes smolagents code
+  blocks reliably. The gpt-oss models do NOT — under CodeAgent they emit native
+  tool calls that Groq rejects ("tool_use_failed"), and they mangle code blobs.
+  A gpt-oss id is therefore actively warned against below.
+* Audio: Groq Whisper (whisper-large-v3-turbo).
+* One GROQ_API_KEY covers text, image, and audio.
 
-Model IDs (defaults, July 2026)
--------------------------------
-Groq's line-up changes fast. On 2026-06-17 Groq deprecated
-``llama-3.3-70b-versatile``, ``llama-3.1-8b-instant`` and
-``llama-4-scout-17b-16e-instruct``. The current recommended replacements are:
-
-    reasoning : openai/gpt-oss-120b     (flagship open-weight, tool-use capable)
-    vision    : qwen/qwen3.6-27b        (multimodal; Groq serves it as preview)
-    audio     : whisper-large-v3-turbo  (fast, cheap, generous free tier)
-
-If Groq rotates these again, override without touching code:
-
-    export GROQ_MODEL_ID="groq/openai/gpt-oss-120b"
-    export GROQ_VISION_MODEL="groq/qwen/qwen3.6-27b"
-    export GROQ_WHISPER_MODEL="whisper-large-v3-turbo"
-
-All three read the same GROQ_API_KEY.
+Everything is overridable by env var:
+    GROQ_MODEL_ID      reasoning+vision model  (default groq/qwen/qwen3.6-27b)
+    GROQ_VISION_MODEL  image model             (default = GROQ_MODEL_ID)
+    GROQ_WHISPER_MODEL audio model             (default whisper-large-v3-turbo)
 """
 
 import os
@@ -49,66 +37,43 @@ from tools import (
     analyze_image,
     transcribe_audio,
     get_youtube_transcript,
+    analyze_youtube_video,
     visit_webpage,
 )
 
 # --------------------------------------------------------------------------- #
-# CONFIG — everything provider-specific lives here                            #
+# CONFIG                                                                      #
 # --------------------------------------------------------------------------- #
-# LiteLLM routes any "groq/..." model id to Groq using GROQ_API_KEY.
-# Qwen (qwen3.6-27b) is used for reasoning: it emits smolagents-style code blocks
-# reliably, unlike Groq's gpt-oss models, which try to emit native tool calls and
-# trip Groq's "Tool choice is none, but model called a tool" error under CodeAgent.
-# It is also multimodal, so the same model powers analyze_image.
 REASONING_MODEL_ID = os.getenv("GROQ_MODEL_ID", "groq/qwen/qwen3.6-27b")
 
-# GAIA answer-format rules, appended to every task. The course grader does exact
-# string matching, so format discipline is worth as much as being right.
-GAIA_STRATEGY = """
-Pick the approach that fits the question:
-- Pure reasoning / math / logic / puzzles (e.g. a table to analyze, a sequence,
-  unit conversions): DO NOT search the web. Write Python and compute the answer
-  directly. You have pandas, numpy, math, statistics, itertools, collections.
-- Facts about the world (people, dates, records, "how many X"): use web_search
-  then visit_webpage to read the best source. For long pages (Wikipedia), if the
-  section you need isn't in the first window, call visit_webpage(url,
-  search="<keyword>") to jump to it.
-- An attached file: use read_file for text/pdf/docx/pptx/csv; for spreadsheets
-  you may also load it yourself, e.g. `import pandas as pd; df =
-  pd.read_excel(path)`, then compute. Use analyze_image for images and
-  transcribe_audio for audio.
-- A YouTube link: use get_youtube_transcript.
-Be efficient: most questions need 1–3 steps. Verify before answering.
-""".strip()
+# Short prompts = fewer tokens per step = fewer rate-limit stalls on the free
+# tier. Keep these tight.
+GAIA_STRATEGY = (
+    "Choose the fewest steps. Pure math/logic/table/puzzle questions: write "
+    "Python and compute (pandas, numpy, math, itertools available) — do NOT "
+    "search. World facts ('how many', dates, records): web_search then "
+    "visit_webpage; for a long page, visit_webpage(url, search='<keyword>') "
+    "jumps to a section. Attached file: read_file (text/pdf/docx/pptx/csv/xlsx) "
+    "or load it with pandas; analyze_image for images; transcribe_audio for "
+    "audio. YouTube: get_youtube_transcript (spoken) or analyze_youtube_video "
+    "(visual). Encoded/reversed text: decode in Python. Verify, then answer."
+)
+
+GAIA_FORMATTING = (
+    "Call final_answer with ONLY the answer — no label, no sentence. "
+    "Number: plain digits, no separators/units unless asked. "
+    "String: no articles, no abbreviations, match the source's spelling. "
+    "List: comma+space separated, no brackets."
+)
 
 
-GAIA_FORMATTING = """
-When you have the answer, call final_answer with ONLY the answer itself — no
-explanation, no "FINAL ANSWER" label, no surrounding sentence.
-
-Format rules for the final answer:
-- Number: no thousands separators, no units (no $, %, km) unless the question
-  explicitly asks for the unit. Use plain Arabic digits.
-- String: no leading articles (a/an/the), no abbreviations (spell out city and
-  country names in full), match the exact spelling/casing of the source.
-- List: comma-separated with a single space after each comma; apply the
-  number/string rules to every element; do NOT wrap the list in brackets.
-- If the question text itself is reversed/scrambled, answer in normal orientation.
-""".strip()
-
-
-# --------------------------------------------------------------------------- #
-# Rate-limit resilient model                                                  #
-# --------------------------------------------------------------------------- #
 # --------------------------------------------------------------------------- #
 # tool_use_failed recovery                                                    #
 # --------------------------------------------------------------------------- #
-# Some Groq models (notably the gpt-oss family) emit a NATIVE tool call even
-# though CodeAgent runs with tool_choice=none, so Groq returns
-#   400 tool_use_failed: "Tool choice is none, but model called a tool"
-# The good news: the rejected payload is echoed back in a `failed_generation`
-# field. We extract the code/tool-call the model wanted and re-present it as a
-# normal CodeAgent code blob, so the step succeeds instead of dying.
+# Some Groq models emit a NATIVE tool call under CodeAgent (tool_choice=none),
+# so Groq returns 400 tool_use_failed and echoes the payload in
+# `failed_generation`. We recover the intended code and return it as a code
+# blob so the step still runs.
 def _extract_failed_generation(err_str: str) -> str | None:
     m = re.search(r'"failed_generation"\s*:\s*"(.*)"\s*\}\s*\}', err_str, re.DOTALL)
     if not m:
@@ -122,7 +87,6 @@ def _extract_failed_generation(err_str: str) -> str | None:
 
 
 def _code_from_payload(payload: str) -> str:
-    """payload ~ {"name": "<tool>", "arguments": <code-or-json>}."""
     payload = payload.strip()
     try:
         obj = json.loads(payload)
@@ -132,14 +96,12 @@ def _code_from_payload(payload: str) -> str:
             if isinstance(args, dict):
                 return args.get("code") or args.get("arguments") or ""
             return str(args)
-        # A real tool -> synthesize a python call to it (tools are py functions).
         if isinstance(args, dict):
             kw = ", ".join(f"{k}={v!r}" for k, v in args.items())
             return f"result = {name}({kw})\nprint(result)"
         return f"result = {name}({args!r})\nprint(result)"
     except Exception:
         pass
-    # Malformed JSON: take the raw code after "arguments":, drop the envelope brace.
     m = re.search(r'"arguments"\s*:\s*', payload)
     code = payload[m.end():] if m else payload
     return re.sub(r'\s*\}\s*$', '', code.strip()).strip()
@@ -152,23 +114,15 @@ def _recover_code_blob(err_str: str) -> str | None:
     code = _code_from_payload(payload)
     if not code.strip():
         return None
-    # CodeAgent's parser looks for a ```py fenced block.
+    # ```py fence is accepted by smolagents' markdown fallback across versions.
     return f"Thought: (recovered from a rejected tool call)\nCode:\n```py\n{code}\n```<end_code>"
 
 
 class GroqLiteLLMModel(LiteLLMModel):
-    """LiteLLMModel hardened for Groq under smolagents CodeAgent.
+    """LiteLLMModel hardened for Groq under CodeAgent: rate-limit backoff +
+    tool_use_failed recovery."""
 
-    Handles two Groq-specific failure modes:
-    * Rate limits — the free/dev tiers cap tokens-per-minute (as low as ~6k),
-      and a CodeAgent keeps the whole trajectory in context, so a multi-step
-      question can trip the limit mid-run. We parse Groq's suggested wait
-      ("try again in 4.2s") and sleep, with exponential backoff as a fallback.
-    * tool_use_failed — a model tried to emit a native tool call; we recover the
-      code from the error and return it as a valid code blob (see above).
-    """
-
-    def __init__(self, *args, max_retries: int = 3, **kwargs):
+    def __init__(self, *args, max_retries: int = 2, **kwargs):
         super().__init__(*args, **kwargs)
         self._max_retries = max_retries
 
@@ -191,14 +145,12 @@ class GroqLiteLLMModel(LiteLLMModel):
                 return super().generate(messages, **kwargs)
             except Exception as e:
                 s = str(e)
-                # 1) Recover a rejected native tool call into a code blob.
                 if "tool_use_failed" in s or "model called a tool" in s:
                     blob = _recover_code_blob(s)
                     if blob:
                         print("[groq] recovered code from a rejected tool call")
                         return ChatMessage(role="assistant", content=blob)
                     raise
-                # 2) Back off on rate limits.
                 if "rate" in s.lower() or "429" in s:
                     last_err = e
                     wait = self._parse_wait_seconds(e, attempt)
@@ -206,52 +158,54 @@ class GroqLiteLLMModel(LiteLLMModel):
                           f"{self._max_retries}); sleeping {wait:.1f}s")
                     time.sleep(wait)
                     continue
-                raise  # anything else: surface immediately
+                raise
         raise RuntimeError(f"Groq rate limit not cleared after "
                            f"{self._max_retries} retries: {last_err}")
 
 
 def build_model() -> GroqLiteLLMModel:
-    """Reasoning model. temperature=0 for deterministic, graded answers."""
     if not os.getenv("GROQ_API_KEY"):
         print("[warn] GROQ_API_KEY is not set — Groq calls will fail.")
+    if "gpt-oss" in REASONING_MODEL_ID:
+        print("[warn] gpt-oss models emit native tool calls that break "
+              "CodeAgent (tool_use_failed) and mangle code blobs. Strongly "
+              "prefer groq/qwen/qwen3.6-27b. Unset GROQ_MODEL_ID to use it.")
     return GroqLiteLLMModel(model_id=REASONING_MODEL_ID, temperature=0.0)
 
 
 # --------------------------------------------------------------------------- #
-# Agent construction                                                          #
+# Agent                                                                       #
 # --------------------------------------------------------------------------- #
 def build_agent(verbose: bool = False) -> CodeAgent:
     model = build_model()
     tools = [
         DuckDuckGoSearchTool(),
         visit_webpage,
-        # summary mode keeps each Wikipedia hit small enough for Groq's tight
-        # per-minute token cap (full-text mode was ~7k tokens per call).
         WikipediaSearchTool(content_type="summary"),
         read_file,
-        analyze_image,      # -> Groq vision
-        transcribe_audio,   # -> Groq Whisper
+        analyze_image,
+        transcribe_audio,
         get_youtube_transcript,
+        analyze_youtube_video,
     ]
     return CodeAgent(
         tools=tools,
         model=model,
-        max_steps=6,
+        max_steps=5,
         verbosity_level=LogLevel.DEBUG if verbose else LogLevel.INFO,
         additional_authorized_imports=[
             "pandas", "numpy", "math", "statistics", "datetime",
             "json", "re", "itertools", "collections",
             "openpyxl", "csv", "docx", "pptx", "bs4",
+            "base64", "codecs", "urllib", "fractions", "decimal",
         ],
     )
 
 
 # --------------------------------------------------------------------------- #
-# Trace + answer normalization                                                #
+# Trace + normalization                                                       #
 # --------------------------------------------------------------------------- #
 def format_trace(agent: CodeAgent) -> str:
-    """Compact post-run summary of the LAST question, for --trace / logs."""
     lines = []
     for step in getattr(agent.memory, "steps", []):
         n = getattr(step, "step_number", None)
@@ -280,8 +234,6 @@ _REVERSED_HINT = re.compile(r"\.(rewsna|drow|ecnetnes)", re.IGNORECASE)
 
 
 def looks_reversed(text: str) -> bool:
-    """Heuristic for GAIA's reversed-text question (starts with '.' and reads
-    backwards). Cheap enough to check every question."""
     if not text:
         return False
     t = text.strip()
@@ -289,33 +241,26 @@ def looks_reversed(text: str) -> bool:
 
 
 def normalize_answer(ans: str) -> str:
-    """Post-process the model's final answer toward GAIA exact-match form."""
     if ans is None:
         return ""
     s = str(ans).strip()
-
-    # Strip a stray "FINAL ANSWER:" / "Answer:" prefix if the model added one.
     s = re.sub(r"^\s*(final answer|answer)\s*:?\s*", "", s, flags=re.IGNORECASE)
-
-    # Strip surrounding quotes and a trailing period (but not a decimal point).
+    # Drop any stray code-blob tags a model may have leaked into the answer.
+    s = s.replace("```py", "").replace("```python", "").replace("```", "")
+    s = s.replace("<code>", "").replace("</code>", "").replace("<end_code>", "")
     s = s.strip().strip('"').strip("'").strip()
     if s.endswith(".") and not re.search(r"\d\.\d", s):
         s = s[:-1].strip()
-
-    # If the whole thing is a single number, drop separators / currency / percent.
     bare = s.replace(",", "").replace("$", "").replace("%", "").strip()
     if re.fullmatch(r"-?\d+(\.\d+)?", bare):
         return bare
-
     return re.sub(r"\s+", " ", s)
 
 
 # --------------------------------------------------------------------------- #
-# Public wrapper (interface preserved for app.py / run_local.py)              #
+# Public wrapper                                                              #
 # --------------------------------------------------------------------------- #
 class GaiaAgent:
-    """Callable used by app.py. One instance answers all questions."""
-
     def __init__(self, verbose: bool = False):
         self.agent = build_agent(verbose=verbose)
         self.last_trace = ""
@@ -324,16 +269,11 @@ class GaiaAgent:
     def __call__(self, question: str, file_path: str | None = None) -> str:
         task = question
         if looks_reversed(question):
-            task += (
-                "\n\nNOTE: the question text above appears to be reversed. "
-                f"Reversed reading:\n{question[::-1]}"
-            )
+            task += ("\n\nNOTE: the question text may be reversed. Reversed "
+                     f"reading:\n{question[::-1]}")
         if file_path:
-            task += (
-                f"\n\nA file is attached at the local path:\n{file_path}\n"
-                "Use read_file / analyze_image / transcribe_audio on that path "
-                "as appropriate."
-            )
+            task += (f"\n\nA file is attached at:\n{file_path}\nUse read_file / "
+                     "analyze_image / transcribe_audio on it as appropriate.")
         task += "\n\n" + GAIA_STRATEGY + "\n\n" + GAIA_FORMATTING
 
         try:
