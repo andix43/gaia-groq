@@ -48,15 +48,20 @@ from tools import (
 # --------------------------------------------------------------------------- #
 # Provider / model selection                                                  #
 # --------------------------------------------------------------------------- #
-# Google retires Gemini model ids fast (2.0 Flash shut down June 2026; 2.5 Flash
-# is closed to new users). These are the GA ids as of 2026-07-21 — first one
-# that the API accepts wins. Check ai.google.dev/gemini-api/docs/models if all
-# of them 404.
+# Google retires Gemini model ids fast, and free-tier quotas differ enormously
+# BY MODEL. The binding limit on the free tier is requests-per-day, not tokens:
+#   gemini-3.1-flash-lite : 15 RPM, 250K TPM, 500 RPD  <- only one that can
+#                                                          finish a full run
+#   gemini-3.6-flash      :  5 RPM, 250K TPM,  20 RPD  <- runs out after ~5 Qs
+#   gemini-3-flash        :  5 RPM, 250K TPM,  20 RPD
+# So flash-lite is the default; set AGENT_MODEL_ID to override (e.g. if you
+# have billing enabled, gemini/gemini-3.6-flash is the stronger model).
+# Check https://ai.google.dev/gemini-api/docs/models if these 404.
 GEMINI_FALLBACKS = [
-    "gemini/gemini-3.6-flash",       # GA workhorse, launched 2026-07-21
-    "gemini/gemini-3.5-flash-lite",  # GA, fastest/cheapest of the 3.5 family
+    "gemini/gemini-3.1-flash-lite",  # best free-tier quota (500 RPD)
+    "gemini/gemini-3.6-flash",       # stronger, but 20 RPD free
     "gemini/gemini-3-flash",
-    "gemini/gemini-flash-latest",    # alias; may point at an experimental model
+    "gemini/gemini-flash-latest",
 ]
 
 
