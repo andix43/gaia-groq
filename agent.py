@@ -80,6 +80,10 @@ VISION_MODEL_ID = os.getenv("AGENT_VISION_MODEL", MODEL_ID)
 MAX_QUESTION_SLEEP = float(os.getenv("GAIA_MAX_QUESTION_SLEEP", "180"))
 MAX_STEPS = int(os.getenv("GAIA_MAX_STEPS", "6"))
 
+# Marker used when the model returns nothing usable, so the final answer
+# handler can tell our own nudge apart from a real answer.
+NUDGE_SENTINEL = "__agent_nudge__"
+
 GAIA_STRATEGY = (
     "Answer in as few steps as possible.\n"
     "- Math/logic/table/puzzle: write Python and compute it. Do NOT search.\n"
@@ -124,15 +128,50 @@ def _strip_think(text):
     return out.strip()
 
 
+def _message_text(msg):
+    """Pull usable text out of a model message.
+
+    Gemini 3.x models 'think' by default and often return the thought parts with
+    an EMPTY text field. LiteLLM surfaces those as `reasoning_content` (or only
+    inside the raw provider response), so a naive `msg.content` read looks empty
+    and the step is lost. Check every place the text can hide.
+    """
+    content = getattr(msg, "content", None)
+    if isinstance(content, str) and content.strip():
+        return content
+    # LiteLLM's reasoning channel
+    for attr in ("reasoning_content", "thinking", "reasoning"):
+        val = getattr(msg, attr, None)
+        if isinstance(val, str) and val.strip():
+            return val
+    # Raw provider payload (Gemini: candidates[].content.parts[].text)
+    raw = getattr(msg, "raw", None)
+    try:
+        choices = raw.get("choices") if isinstance(raw, dict) else getattr(raw, "choices", None)
+        if choices:
+            m = choices[0]["message"] if isinstance(choices[0], dict) else choices[0].message
+            for key in ("content", "reasoning_content"):
+                v = m.get(key) if isinstance(m, dict) else getattr(m, key, None)
+                if isinstance(v, str) and v.strip():
+                    return v
+    except Exception:
+        pass
+    try:
+        cands = raw.get("candidates") if isinstance(raw, dict) else getattr(raw, "candidates", None)
+        if cands:
+            parts = cands[0]["content"]["parts"]
+            text = "".join(p.get("text", "") for p in parts if isinstance(p, dict))
+            if text.strip():
+                return text
+    except Exception:
+        pass
+    return None
+
+
 def _is_empty_message(msg) -> bool:
     if getattr(msg, "tool_calls", None):
         return False
-    content = getattr(msg, "content", None)
-    if content is None:
-        return True
-    if isinstance(content, str):
-        return not content.strip()
-    return not content
+    return not _message_text(msg)
 
 
 def _extract_failed_generation(err_str: str):
@@ -234,18 +273,24 @@ class RobustLiteLLMModel(LiteLLMModel):
         for attempt in range(self._max_retries):
             try:
                 msg = super().generate(messages, **kwargs)
-                if getattr(msg, "content", None):
-                    msg.content = _strip_think(msg.content)
-                if _is_empty_message(msg):
-                    # Model returned nothing usable. Retry rather than lose the
-                    # whole question to "Error in generating model output:".
-                    print(f"[model] empty generation "
-                          f"(attempt {attempt + 1}/{self._max_retries}); retrying")
-                    time.sleep(1.0 + attempt)
-                    continue
-                return msg
+                text = _message_text(msg)
+                if text:
+                    # Promote recovered text (e.g. Gemini thought parts) into
+                    # content so smolagents' parser can see the code block.
+                    msg.content = _strip_think(text)
+                    return msg
+                print(f"[model] empty generation "
+                      f"(attempt {attempt + 1}/{self._max_retries}); retrying")
+                time.sleep(1.0 + attempt)
+                continue
             except Exception as e:
                 s = str(e)
+                # Provider rejected the thinking-control kwarg -> drop, retry.
+                if "reasoning_effort" in s and isinstance(
+                        getattr(self, "kwargs", None), dict):
+                    if self.kwargs.pop("reasoning_effort", None) is not None:
+                        print("[model] reasoning_effort unsupported; dropped")
+                        continue
                 if "tool_use_failed" in s or "model called a tool" in s:
                     blob = _recover_code_blob(s)
                     if blob:
@@ -283,11 +328,11 @@ class RobustLiteLLMModel(LiteLLMModel):
             raise RuntimeError(f"generation failed after {self._max_retries} "
                                f"attempts: {last_err}")
         # All attempts returned empty -> emit a nudge so the step still runs.
-        print("[model] all attempts empty; nudging agent to emit code")
+        print("[model] all attempts empty; nudging agent to answer")
         return ChatMessage(
             role="assistant",
-            content=("Thought: I must emit code.\n<code>\n"
-                     "print('retry: emit an answer now')\n</code>"),
+            content=("Thought: I will answer now with what I already know.\n"
+                     f"<code>\nprint('{NUDGE_SENTINEL}')\n</code>"),
         )
 
 
@@ -296,8 +341,18 @@ def build_model() -> RobustLiteLLMModel:
         print("[warn] no GEMINI_API_KEY or GROQ_API_KEY set — calls will fail.")
     if "gpt-oss" in MODEL_ID:
         print("[warn] gpt-oss breaks CodeAgent (tool_use_failed / bad code "
-              "blobs). Prefer gemini/gemini-2.5-flash or groq/qwen/qwen3.6-27b.")
-    return RobustLiteLLMModel(model_id=MODEL_ID, temperature=0.0)
+              "blobs). Prefer a Gemini Flash model or groq/qwen/qwen3.6-27b.")
+
+    kwargs = {}
+    if MODEL_ID.startswith("gemini/"):
+        # Gemini 3.x thinks by default and frequently returns ONLY thought
+        # tokens with an empty text field, which looks like an empty generation
+        # and loses the step. Turn thinking off so it emits code directly.
+        # (temperature is deprecated for Gemini 3+, so it is omitted here.)
+        kwargs["reasoning_effort"] = "disable"
+    else:
+        kwargs["temperature"] = 0.0
+    return RobustLiteLLMModel(model_id=MODEL_ID, **kwargs)
 
 
 # --------------------------------------------------------------------------- #
@@ -355,7 +410,8 @@ def format_trace(agent: CodeAgent) -> str:
 
 
 _BAD_OBS = re.compile(r"error|traceback|not found|failed|no wikipedia|"
-                      r"search results|\[window around|\[first \d+ of",
+                      r"search results|\[window around|\[first \d+ of|"
+                      r"__agent_nudge__|retry: emit an answer",
                       re.IGNORECASE)
 
 
@@ -445,8 +501,12 @@ class GaiaAgent:
         self.last_trace = format_trace(self.agent)
         answer = normalize_answer(raw) if raw is not None else ""
 
-        # If the run produced nothing usable, try to recover a printed answer.
-        if not answer or answer.upper() == "ERROR":
+        # If the run produced nothing usable — including the case where the
+        # final answer is just our own nudge text — recover a printed answer.
+        looks_like_nudge = (NUDGE_SENTINEL in answer
+                            or "I will answer now with what" in answer
+                            or "I must emit code" in answer)
+        if not answer or answer.upper() == "ERROR" or looks_like_nudge:
             rescued = salvage_answer(self.agent)
             if rescued:
                 print(f"[salvage] recovered printed answer: {rescued!r}")
