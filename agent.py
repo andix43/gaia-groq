@@ -84,6 +84,17 @@ MAX_STEPS = int(os.getenv("GAIA_MAX_STEPS", "6"))
 # handler can tell our own nudge apart from a real answer.
 NUDGE_SENTINEL = "__agent_nudge__"
 
+# Free-tier guards. Gemini 3.1 Flash Lite free tier = 15 RPM / 500 RPD.
+# MIN_REQUEST_INTERVAL keeps us under the per-minute cap without ever needing a
+# 429 retry; MAX_REQUESTS stops the run before the daily cap is hit so the
+# answers gathered so far can still be submitted.
+MIN_REQUEST_INTERVAL = float(os.getenv("GAIA_MIN_REQUEST_INTERVAL", "4.2"))
+MAX_REQUESTS = int(os.getenv("GAIA_MAX_REQUESTS", "400"))
+
+
+class RequestBudgetExceeded(RuntimeError):
+    """Raised when the run has used its allotted API requests."""
+
 GAIA_STRATEGY = (
     "Answer in as few steps as possible.\n"
     "- Math/logic/table/puzzle: write Python and compute it. Do NOT search.\n"
@@ -232,13 +243,27 @@ class RobustLiteLLMModel(LiteLLMModel):
       3. empty generation     -> retry the call instead of losing the question
     """
 
-    def __init__(self, *args, max_retries: int = 3, **kwargs):
+    def __init__(self, *args, max_retries: int = 2, **kwargs):
         super().__init__(*args, **kwargs)
         self._max_retries = max_retries
         self._question_sleep = 0.0
+        self.requests_used = 0
+        self._last_request_at = 0.0
 
     def new_question(self):
         self._question_sleep = 0.0
+
+    def _throttle(self):
+        """Space out calls so the per-minute limit is never reached, and stop
+        the run cleanly before the daily limit is."""
+        if self.requests_used >= MAX_REQUESTS:
+            raise RequestBudgetExceeded(
+                f"request budget reached ({self.requests_used}/{MAX_REQUESTS})")
+        gap = time.time() - self._last_request_at
+        if self._last_request_at and gap < MIN_REQUEST_INTERVAL:
+            time.sleep(MIN_REQUEST_INTERVAL - gap)
+        self._last_request_at = time.time()
+        self.requests_used += 1
 
     @staticmethod
     def _parse_wait_seconds(err: Exception, attempt: int) -> float:
@@ -271,8 +296,15 @@ class RobustLiteLLMModel(LiteLLMModel):
     def generate(self, messages, **kwargs):  # type: ignore[override]
         last_err = None
         for attempt in range(self._max_retries):
+            call_kwargs = dict(kwargs)
+            if attempt > 0:
+                # Gemini can return EMPTY content when it stops immediately on
+                # one of smolagents' stop sequences, or when thinking consumes
+                # the response. Vary the call instead of repeating it verbatim.
+                call_kwargs.pop("stop_sequences", None)
             try:
-                msg = super().generate(messages, **kwargs)
+                self._throttle()
+                msg = super().generate(messages, **call_kwargs)
                 text = _message_text(msg)
                 if text:
                     # Promote recovered text (e.g. Gemini thought parts) into
@@ -283,13 +315,18 @@ class RobustLiteLLMModel(LiteLLMModel):
                       f"(attempt {attempt + 1}/{self._max_retries}); retrying")
                 time.sleep(1.0 + attempt)
                 continue
+            except RequestBudgetExceeded:
+                raise
             except Exception as e:
                 s = str(e)
                 # Provider rejected the thinking-control kwarg -> drop, retry.
-                if "reasoning_effort" in s and isinstance(
-                        getattr(self, "kwargs", None), dict):
-                    if self.kwargs.pop("reasoning_effort", None) is not None:
-                        print("[model] reasoning_effort unsupported; dropped")
+                if isinstance(getattr(self, "kwargs", None), dict):
+                    dropped = False
+                    for bad in ("reasoning_effort", "thinking"):
+                        if bad in s and self.kwargs.pop(bad, None) is not None:
+                            print(f"[model] {bad} unsupported; dropped")
+                            dropped = True
+                    if dropped:
                         continue
                 if "tool_use_failed" in s or "model called a tool" in s:
                     blob = _recover_code_blob(s)
@@ -345,6 +382,9 @@ def build_model() -> RobustLiteLLMModel:
 
     kwargs = {}
     if MODEL_ID.startswith("gemini/"):
+        # Two spellings; LiteLLM honours whichever this model supports and the
+        # generate() loop drops either one if the provider rejects it.
+        kwargs["thinking"] = {"type": "disabled", "budget_tokens": 0}
         # Gemini 3.x thinks by default and frequently returns ONLY thought
         # tokens with an empty text field, which looks like an empty generation
         # and loses the step. Turn thinking off so it emits code directly.
@@ -477,6 +517,10 @@ class GaiaAgent:
         self.last_trace = ""
         print(f"GaiaAgent ready ({MODEL_ID}).")
 
+    @property
+    def requests_used(self) -> int:
+        return getattr(self.agent.model, "requests_used", 0)
+
     def __call__(self, question: str, file_path: str | None = None) -> str:
         try:
             self.agent.model.new_question()
@@ -495,6 +539,13 @@ class GaiaAgent:
         raw = None
         try:
             raw = self.agent.run(task)
+        except RequestBudgetExceeded:
+            self.last_trace = format_trace(self.agent)
+            rescued = salvage_answer(self.agent)
+            if rescued:
+                print(f"[salvage] budget hit; using printed answer: {rescued!r}")
+                return normalize_answer(rescued)
+            raise
         except Exception as e:
             print(f"[agent error] {type(e).__name__}: {e}")
 
