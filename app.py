@@ -2,7 +2,7 @@
 Gradio app for the GAIA Agents Course final assignment (Groq edition).
 
 Duplicate the course template Space, drop in this file plus agent.py, tools.py,
-requirements.txt, add GROQ_API_KEY as a Space secret, and keep the Space PUBLIC.
+requirements.txt, add GEMINI_API_KEY (recommended) or GROQ_API_KEY as a Space secret, and keep the Space PUBLIC.
 Log in with Hugging Face, then click "Run & Submit All".
 
 You can also skip this UI entirely and submit from Colab with run_local.py; the
@@ -22,8 +22,10 @@ API_URL = "https://agents-course-unit4-scoring.hf.space"
 
 def _download(task_id, file_name):
     try:
-        r = requests.get(f"{API_URL}/files/{task_id}", timeout=60)
-        r.raise_for_status()
+        r = requests.get(f"{API_URL}/files/{task_id}",
+                         headers={"User-Agent": "Mozilla/5.0"}, timeout=60)
+        if r.status_code != 200 or not r.content:
+            return None
     except Exception:
         return None
     suffix = os.path.splitext(file_name)[1] if file_name else ""
@@ -63,7 +65,12 @@ def run_and_submit_all(profile: gr.OAuthProfile | None):
             continue
         try:
             fp = _download(task_id, file_name) if file_name else None
-            ans = agent(question, fp)
+            if file_name and fp is None:
+                # Scoring API serves no file for this task -> unanswerable.
+                print(f"[{task_id}] attachment not served; skipping")
+                ans = "ERROR"
+            else:
+                ans = agent(question, fp)
         except Exception as e:
             ans = "ERROR"
             print(f"[{task_id}] failed: {e}")
@@ -100,7 +107,7 @@ with gr.Blocks() as demo:
     gr.Markdown(
         "1. Log in with Hugging Face. 2. Click **Run & Submit All**. "
         "The agent answers all 20 questions and submits for scoring. "
-        "(A full run can take a while on Groq's free tier.)"
+        "(Questions whose attachment the API does not serve are skipped.)"
     )
     gr.LoginButton()
     run_button = gr.Button("Run & Submit All", variant="primary")
