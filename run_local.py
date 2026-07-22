@@ -26,7 +26,7 @@ import time
 
 import requests
 
-from agent import GaiaAgent
+from agent import GaiaAgent, RequestBudgetExceeded
 
 API_URL = "https://agents-course-unit4-scoring.hf.space"
 CACHE = "questions_cache.json"
@@ -147,6 +147,10 @@ def main():
                 skipped += 1
             else:
                 ans = answer_one(agent, item["question"], file_path, args.timeout)
+        except RequestBudgetExceeded as e:
+            print(f"\n[budget] {e}\n[budget] stopping here; answers so far are "
+                  "kept and can still be submitted.")
+            break
         except KeyboardInterrupt:
             print("\n[interrupted] keeping answers so far.")
             break
@@ -171,6 +175,7 @@ def main():
     print("\n" + "=" * 80)
     print(f"Finished {len(results)} question(s) in {time.time() - t0:.0f}s "
           f"({skipped} skipped as unanswerable).")
+    print(f"API requests used: {agent.requests_used}")
     print(f"Produced an answer for {len(answered)}/{len(results)}:")
     for i, a in answered:
         print(f"  [{i:2d}] {a!r}")
