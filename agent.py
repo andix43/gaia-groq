@@ -48,12 +48,24 @@ from tools import (
 # --------------------------------------------------------------------------- #
 # Provider / model selection                                                  #
 # --------------------------------------------------------------------------- #
+# Google retires Gemini model ids fast (2.0 Flash shut down June 2026; 2.5 Flash
+# is closed to new users). These are the GA ids as of 2026-07-21 — first one
+# that the API accepts wins. Check ai.google.dev/gemini-api/docs/models if all
+# of them 404.
+GEMINI_FALLBACKS = [
+    "gemini/gemini-3.6-flash",       # GA workhorse, launched 2026-07-21
+    "gemini/gemini-3.5-flash-lite",  # GA, fastest/cheapest of the 3.5 family
+    "gemini/gemini-3-flash",
+    "gemini/gemini-flash-latest",    # alias; may point at an experimental model
+]
+
+
 def _resolve_model_id() -> str:
     explicit = os.getenv("AGENT_MODEL_ID") or os.getenv("GROQ_MODEL_ID")
     if explicit:
         return explicit
     if os.getenv("GEMINI_API_KEY"):
-        return "gemini/gemini-2.5-flash"
+        return GEMINI_FALLBACKS[0]
     return "groq/qwen/qwen3.6-27b"
 
 
@@ -197,6 +209,21 @@ class RobustLiteLLMModel(LiteLLMModel):
             return float(m.group(1))
         return min(45.0, (2 ** attempt) + random.uniform(0, 1))
 
+    def _try_next_model(self) -> bool:
+        """Swap to the next known-good model id after a deprecation 404."""
+        if not self.model_id.startswith("gemini/"):
+            return False
+        try:
+            idx = GEMINI_FALLBACKS.index(self.model_id)
+        except ValueError:
+            idx = -1
+        if idx + 1 >= len(GEMINI_FALLBACKS):
+            return False
+        new_id = GEMINI_FALLBACKS[idx + 1]
+        print(f"[model] {self.model_id} unavailable -> switching to {new_id}")
+        self.model_id = new_id
+        return True
+
     def generate(self, messages, **kwargs):  # type: ignore[override]
         last_err = None
         for attempt in range(self._max_retries):
@@ -220,6 +247,15 @@ class RobustLiteLLMModel(LiteLLMModel):
                         print("[model] recovered code from a rejected tool call")
                         return ChatMessage(role="assistant", content=blob)
                     raise
+                if ("404" in s or "NOT_FOUND" in s or "no longer available" in s
+                        or "NotFoundError" in type(e).__name__):
+                    last_err = e
+                    if self._try_next_model():
+                        continue
+                    raise RuntimeError(
+                        "no usable Gemini model id; check "
+                        "https://ai.google.dev/gemini-api/docs/models and set "
+                        f"AGENT_MODEL_ID. Last error: {e}")
                 if "rate" in s.lower() or "429" in s:
                     last_err = e
                     wait = self._parse_wait_seconds(e, attempt)
